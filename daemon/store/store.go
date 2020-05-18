@@ -42,6 +42,10 @@ type Store struct {
 	RaftTimeout time.Duration
 	memoryOnly bool
 
+	// when using TLS both must be specified
+	CertFile string
+	KeyFile  string
+
 	mu sync.Mutex
 	m  map[string]string // The key-value store for the system.
 
@@ -92,7 +96,18 @@ func (s *Store) Open(enableSingle bool, localID string) error {
 	if err != nil {
 		return err
 	}
-	transport, err := raft.NewTCPTransport(s.RaftBind, addr, 3, 10*time.Second, os.Stderr)
+
+	var transport *raft.NetworkTransport
+	if s.CertFile != "" && s.KeyFile != "" {
+		transport, err = newTLSTCPTransport(
+			s.CertFile, s.KeyFile,
+			s.RaftBind, addr,
+			3, 10*time.Second,
+			os.Stderr,
+		)
+	} else {
+		transport, err = raft.NewTCPTransport(s.RaftBind, addr, 3, 10*time.Second, os.Stderr)
+	}
 	if err != nil {
 		return err
 	}
