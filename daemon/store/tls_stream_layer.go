@@ -6,8 +6,10 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/hashicorp/raft"
 )
 
@@ -15,6 +17,77 @@ var (
 	errNotAdvertisable = errors.New("local bind address is not advertisable")
 	errNotTCP          = errors.New("local address is not a TCP address")
 )
+
+// hotSwappingCertificateProvider implements a file-watching certificate provider
+// this provides hot-swapping of certificates if certs need to be rotated on a live cluster.
+type hotSwappingCertificateProvider struct {
+	mu          sync.Mutex
+	certFile    string
+	keyFile     string
+	certificate *tls.Certificate
+}
+
+func (p *hotSwappingCertificateProvider) init() (*tls.Certificate, error) {
+	cer, err := tls.LoadX509KeyPair(p.certFile, p.keyFile)
+	if err != nil {
+		return nil, err
+	}
+	return &cer, nil
+}
+
+func (p *hotSwappingCertificateProvider) run() error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+
+	go func() {
+		defer watcher.Close()
+
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&fsnotify.Write == fsnotify.Write {
+					// this file was modified, attempt to reload
+					p.reloadCertificate()
+				}
+			case _, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				// TODO: something with these errors
+			}
+		}
+	}()
+
+	err = watcher.Add(p.certFile)
+	if err != nil {
+		return err
+	}
+	return watcher.Add(p.keyFile)
+}
+
+func (p *hotSwappingCertificateProvider) reloadCertificate() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	cer, err := tls.LoadX509KeyPair(p.certFile, p.keyFile)
+	if err != nil {
+		return err
+	}
+
+	p.certificate = &cer
+	return nil
+}
+
+func (p *hotSwappingCertificateProvider) getCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.certificate, nil
+}
 
 func newTLSTCPTransport(
 	certFile string,
@@ -25,12 +98,20 @@ func newTLSTCPTransport(
 	timeout time.Duration,
 	logOutput io.Writer,
 ) (*raft.NetworkTransport, error) {
-	cer, err := tls.LoadX509KeyPair(certFile, serverKey)
+	certProvider := &hotSwappingCertificateProvider{
+		certFile: certFile,
+		keyFile:  serverKey,
+	}
+	_, err := certProvider.init()
 	if err != nil {
 		return nil, err
 	}
 
-	config := &tls.Config{Certificates: []tls.Certificate{cer}}
+	config := &tls.Config{
+		GetCertificate:           certProvider.getCertificate,
+		PreferServerCipherSuites: true,
+		MinVersion:               tls.VersionTLS13,
+	}
 	ln, err := tls.Listen("tcp", bindAddr, config)
 	if err != nil {
 		return nil, err
@@ -62,7 +143,7 @@ func newTLSTCPTransport(
 }
 
 type tlsStreamLayer struct {
-	listener net.Listener
+	listener  net.Listener
 	advertise net.Addr
 }
 
